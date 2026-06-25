@@ -1,0 +1,181 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// HM Store — Google Apps Script Backend
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── CONFIG ──────────────────────────────────────────────────────────────────
+var SPREADSHEET_ID  = "1Jt91K8shOibn0MX9npk6qB5dsb64mj5CVsvufJwfvcY";
+var SHEET_PRODUCTS  = "DATA TOKO";
+var SHEET_ORDERS    = "PESANAN";
+var DRIVE_FOLDER_ID = "1h2DJTDO9TaYqgSU1kOl-U_7QJ11SFvjn";  // ← Isi dengan ID folder Google Drive untuk simpan bukti transfer
+                            //   Buka drive.google.com → buat folder → klik kanan → "Get ID"
+                            //   Contoh: "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// doGet — serve the web app
+// ─────────────────────────────────────────────────────────────────────────────
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('HM Store')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getProducts — baca sheet DATA TOKO
+// Kolom: A=Tipe, B=Nama, C=Harga, D=Gambar(URL), E=Deskripsi
+// ─────────────────────────────────────────────────────────────────────────────
+function getProducts() {
+  try {
+    var ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+    var sheet = ss.getSheetByName(SHEET_PRODUCTS);
+    if (!sheet) {
+      return { success: false, error: "Sheet '" + SHEET_PRODUCTS + "' tidak ditemukan." };
+    }
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return { success: true, data: [] };
+
+    var values   = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
+    var products = [];
+
+    for (var i = 0; i < values.length; i++) {
+      var row  = values[i];
+      var nama = row[1] ? String(row[1]).trim() : "";
+      if (!nama) continue;
+
+      products.push({
+        id:       i,
+        tipe:     row[0] ? String(row[0]).trim() : "",
+        nama:     nama,
+        harga:    row[2] ? Number(row[2]) : 0,
+        gambar:   row[3] ? String(row[3]).trim() : "",
+        deskripsi: row[4] ? String(row[4]).trim() : ""
+      });
+    }
+
+    return { success: true, data: products };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// saveOrder — simpan pesanan ke sheet PESANAN + upload bukti ke Drive
+//
+// Struktur sheet PESANAN (header di baris 1):
+//  A  Tanggal
+//  B  No. Pesanan
+//  C  Nama Pembeli
+//  D  Nomor HP
+//  E  Alamat
+//  F  Patokan
+//  G  Catatan
+//  H  Latitude
+//  I  Longitude
+//  J  Jarak
+//  K  Metode Pengiriman
+//  L  Ongkos Kirim
+//  M  Subtotal Produk
+//  N  Total Bayar
+//  O  Detail Produk
+//  P  Link Bukti Transfer
+//  Q  Status
+// ─────────────────────────────────────────────────────────────────────────────
+function saveOrder(payload) {
+  try {
+    var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+    // ── Pastikan sheet PESANAN ada, jika tidak buat baru ──
+    var sheet = ss.getSheetByName(SHEET_ORDERS);
+    if (!sheet) {
+      sheet = ss.insertSheet(SHEET_ORDERS);
+      var headers = [
+        'Tanggal', 'No. Pesanan', 'Nama Pembeli', 'Nomor HP',
+        'Alamat', 'Patokan', 'Catatan',
+        'Latitude', 'Longitude', 'Jarak',
+        'Metode Pengiriman', 'Ongkos Kirim', 'Subtotal Produk', 'Total Bayar',
+        'Detail Produk', 'Link Bukti Transfer', 'Status'
+      ];
+      sheet.appendRow(headers);
+      sheet.getRange(1, 1, 1, headers.length)
+        .setBackground('#1F2937')
+        .setFontColor('#FFFFFF')
+        .setFontWeight('bold');
+      sheet.setFrozenRows(1);
+    }
+
+    // ── Upload bukti transfer ke Google Drive ──
+    var buktiUrl = "";
+    if (payload.buktiBase64 && DRIVE_FOLDER_ID) {
+      try {
+        var ext    = payload.buktiMimeType === 'image/png' ? '.png' : '.jpg';
+        var fname  = 'bukti_' + payload.orderNumber + ext;
+        var blob   = Utilities.newBlob(Utilities.base64Decode(payload.buktiBase64), payload.buktiMimeType, fname);
+        var folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+        var file   = folder.createFile(blob);
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        buktiUrl = file.getUrl();
+      } catch (driveErr) {
+        // Upload gagal tapi tetap lanjut simpan data
+        buktiUrl = "Upload gagal: " + driveErr.toString();
+      }
+    } else if (payload.buktiBase64 && !DRIVE_FOLDER_ID) {
+      buktiUrl = "[DRIVE_FOLDER_ID belum diisi di Code.gs]";
+    }
+
+    // ── Format detail produk ──
+    var detailProduk = (payload.products || []).map(function(p) {
+      return p.nama + ' (' + p.qty + 'x) = Rp ' + Number(p.subtotal).toLocaleString('id-ID');
+    }).join(' | ');
+
+    // ── Append row ──
+    sheet.appendRow([
+      payload.tanggal            || new Date().toLocaleString('id-ID'),
+      payload.orderNumber        || '',
+      payload.nama               || '',
+      payload.hp                 || '',
+      payload.alamat             || '',
+      payload.patokan            || '',
+      payload.catatan            || '',
+      payload.lat                || '',
+      payload.lng                || '',
+      payload.jarak              || '',
+      payload.metodePengiriman   || '',
+      Number(payload.ongkir)     || 0,
+      Number(payload.subtotalProduk) || 0,
+      Number(payload.totalBayar) || 0,
+      detailProduk,
+      buktiUrl,
+      'MENUNGGU VERIFIKASI'
+    ]);
+
+    // ── Auto-resize kolom ──
+    sheet.autoResizeColumns(1, 17);
+
+    return { success: true, buktiUrl: buktiUrl, orderNumber: payload.orderNumber };
+
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// updateOrderStatus — helper untuk admin ubah status pesanan
+// Dipanggil manual dari Apps Script console jika diperlukan
+// ─────────────────────────────────────────────────────────────────────────────
+function updateOrderStatus(orderNumber, newStatus) {
+  try {
+    var ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+    var sheet = ss.getSheetByName(SHEET_ORDERS);
+    if (!sheet) return { success: false, error: 'Sheet PESANAN tidak ditemukan' };
+
+    var data = sheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][1]).trim() === String(orderNumber).trim()) {
+        sheet.getRange(i + 1, 17).setValue(newStatus);
+        return { success: true, message: 'Status diperbarui: ' + newStatus };
+      }
+    }
+    return { success: false, error: 'No. Pesanan tidak ditemukan: ' + orderNumber };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
